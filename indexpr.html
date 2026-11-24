@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crosstown: parade-aware crossing agent (Macy's 100th)</title>
+<style>
+:root{--ink:#202124;--mute:#5f6368;--line:#dadce0;--bg:#fff;--panel:#f6f8fc;--blue:#1a73e8;--red:#d93025;--yellow:#f9ab00;--green:#188038}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--ink);background:var(--bg)}
+header{padding:16px 20px;border-bottom:1px solid var(--line)}h1{margin:0;font-size:22px}header p{margin:4px 0 0;color:var(--mute)}
+main{display:grid;grid-template-columns:380px 1fr;min-height:calc(100vh - 80px)}
+@media(max-width:900px){main{grid-template-columns:1fr}#map{height:55vh}}
+aside{padding:16px 20px;border-right:1px solid var(--line);overflow:auto}
+label{display:block;font-weight:600;font-size:13px;margin:10px 0 4px}
+input,select,button{font:inherit;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+button{cursor:pointer;font-weight:600}button.primary{background:var(--blue);color:#fff;border-color:var(--blue);margin-top:14px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#map{min-height:420px}
+.card{background:var(--panel);border-radius:10px;padding:12px;margin-top:12px}
+.trace{font:12px/1.45 ui-monospace,Menlo,monospace;white-space:pre-wrap;max-height:260px;overflow:auto}
+.opt{border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px;background:#fff}
+.opt.best{border:2px solid var(--green)}.opt.bad{opacity:.55}
+.pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;background:#e8eaed;margin-left:4px}
+.warn{color:var(--red);font-weight:600}.ok{color:var(--green);font-weight:600}
+.approve{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+small{color:var(--mute)}
+</style>
+</head>
+<body>
+<header>
+ <h1>Crosstown 🦃 <small>get across the Macy's 100th parade route, hands-free</small></h1>
+ <p>Thu Nov 26, 2026 · step-off 8:30 a.m. at W 77th St &amp; Central Park West · ends ~noon at Herald Square. The route is a 2.5-mile wall between the West Side and everything east of it.</p>
+</header>
+<main>
+<aside>
+ <label for="key">Google Maps Platform demo key <small>(kept in your browser only, never committed)</small></label>
+ <input id="key" placeholder="Paste key, or open with ?key=YOUR_KEY">
+ <label for="preset">Scenario</label>
+ <select id="preset">
+  <option value="0">UWS family → Upper East Side dinner (crosses CPW)</option>
+  <option value="1">Hell's Kitchen → Murray Hill (crosses 6th Ave)</option>
+  <option value="2">Chelsea → West Village (no crossing, agent should do nothing)</option>
+ </select>
+ <label for="from">From</label><input id="from">
+ <label for="to">To</label><input id="to">
+ <div class="row">
+  <div><label for="dep">Leave at (Thu 11/26)</label><input id="dep" type="time" value="09:45"></div>
+  <div><label for="by">Arrive by</label><input id="by" type="time" value="11:00"></div>
+ </div>
+ <div class="row">
+  <div><label for="mob">Mobility</label><select id="mob"><option value="none">No constraints</option><option value="stroller">Stroller</option><option value="wheelchair">Wheelchair</option></select></div>
+  <div><label for="contact">Notify (ETA text)</label><input id="contact" value="Aunt Rosa"></div>
+ </div>
+ <label for="wind">Wind source</label>
+ <select id="wind"><option value="live">Live: Google Weather API forecast for parade hours</option><option value="calm">Simulate calm (12 mph, gusts 18)</option><option value="gusty">Simulate gusty (26 mph, gusts 41)</option></select>
+ <button class="primary" id="go">Plan my crossing</button>
+ <div class="card" id="result"><small>The agent's plan and the approval step appear here.</small></div>
+ <div class="card"><b>Agent trace</b> <small>(each line = one tool call from tools.json)</small><div class="trace" id="trace"></div></div>
+</aside>
+<div id="map"></div>
+</main>
+<script>
+// ---------- Data: parade barrier (approximate corners, for prototyping) ----------
+// Barrier = staging zone (CPW 86th→77th) + parade route (77th & CPW → Columbus Circle → 59th St → 6th Ave → 34th St → 7th Ave)
+const BARRIER=[[40.7860,-73.9690],[40.7795,-73.9737],[40.7681,-73.9819],[40.7661,-73.9792],[40.7650,-73.9762],[40.7598,-73.9801],[40.7547,-73.9842],[40.7496,-73.9877],[40.7505,-73.9910]];
+const DAY='2026-11-26', TZ='-05:00';
+const RESTRICT={start:'06:00',end:'13:00'}; // assumption: surface crossings restricted/controlled; NYPD sets actual crossing points
+const WIND_LIMIT={sustained:23,gust:34};    // NYC balloon-flying thresholds (mph)
+const DETOURS=[
+ {id:'south',name:'Walk around the parade\'s south end (6th Ave & W 32nd St)',ll:[40.7478,-73.9890]},
+ {id:'north',name:'Walk around the north end of staging (CPW & W 88th St)',ll:[40.7872,-73.9682]}];
+const PRESETS=[
+ ['W 75th St & Amsterdam Ave, New York, NY','E 74th St & Lexington Ave, New York, NY'],
+ ['W 45th St & 9th Ave, New York, NY','E 38th St & Lexington Ave, New York, NY'],
+ ['W 23rd St & 8th Ave, New York, NY','Bleecker St & Christopher St, New York, NY']];
+
+// ---------- Helpers ----------
+const $=s=>document.querySelector(s);
+const log=t=>{$('#trace').textContent+=t+'\n';$('#trace').scrollTop=1e9};
+const mins=d=>Math.round(parseInt(d||'0',10)/60);
+const iso=t=>`${DAY}T${t}:00${TZ}`;
+const hm=d=>d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZone:'America/New_York'});
+function decode(str){let i=0,lat=0,lng=0,out=[];while(i<str.length){for(const k of[0,1]){let b,s=0,r=0;do{b=str.charCodeAt(i++)-63;r|=(b&31)<<s;s+=5}while(b>=32);const d=r&1?~(r>>1):r>>1;if(k===0)lat+=d;else lng+=d}out.push([lat/1e5,lng/1e5])}return out}
+function cross(a,b,c,d){const o=(p,q,r)=>Math.sign((q[1]-p[1])*(r[0]-q[0])-(q[0]-p[0])*(r[1]-q[1]));return o(a,b,c)!==o(a,b,d)&&o(c,d,a)!==o(c,d,b)}
+function crossesBarrier(pts){for(let i=1;i<pts.length;i++)for(let j=1;j<BARRIER.length;j++)if(cross(pts[i-1],pts[i],BARRIER[j-1],BARRIER[j]))return true;return false}
+function inWindow(t){return t>=RESTRICT.start&&t<=RESTRICT.end}
+
+// ---------- Tools (each maps 1:1 to a tool in tools.json) ----------
+async function compute_route({origin,destination,mode,via,departure},key){
+ const body={origin:{address:origin},destination:{address:destination},travelMode:mode};
+ if(via)body.intermediates=[{location:{latLng:{latitude:via[0],longitude:via[1]}}}];
+ if(mode==='TRANSIT'){body.departureTime=departure;body.transitPreferences={routingPreference:'LESS_WALKING'}}
+ const r=await fetch('https://routes.googleapis.com/directions/v2:computeRoutes',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':key,
+  'X-Goog-FieldMask':'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.travelMode,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.transitDetails.transitLine.nameShort,routes.legs.steps.transitDetails.transitLine.vehicle.type'},body:JSON.stringify(body)});
+ if(!r.ok)throw new Error('Routes API '+r.status+': '+(await r.text()).slice(0,160));
+ const j=await r.json();if(!j.routes||!j.routes.length)throw new Error('no route');return j.routes[0];
+}
+async function get_wind_outlook(key,mode){
+ if(mode==='calm')return{sustained:12,gust:18,source:'simulated'};
+ if(mode==='gusty')return{sustained:26,gust:41,source:'simulated'};
+ const base=`https://weather.googleapis.com/v1/forecast/hours:lookup?key=${encodeURIComponent(key)}&location.latitude=40.7650&location.longitude=-73.9762&hours=120&unitsSystem=IMPERIAL&pageSize=24`;
+ let tok='',hours=[];
+ for(let p=0;p<6;p++){const r=await fetch(base+(tok?'&pageToken='+encodeURIComponent(tok):''));if(!r.ok)throw new Error('Weather API '+r.status);const j=await r.json();hours=hours.concat(j.forecastHours||[]);tok=j.nextPageToken;if(!tok)break}
+ const s=new Date(iso('08:00')),e=new Date(iso('12:00'));
+ const w=hours.filter(h=>{const t=new Date(h.interval&&h.interval.startTime);return t>=s&&t<=e});
+ if(!w.length)throw new Error('forecast does not reach parade hours yet');
+ return{sustained:Math.max(...w.map(h=>h.wind?.speed?.value||0)),gust:Math.max(...w.map(h=>h.wind?.gust?.value||0)),source:'Google Weather API, '+w.length+' parade hours'};
+}
+function get_parade_disruptions(depTime){
+ return{active:inWindow(depTime),window:`${RESTRICT.start}-${RESTRICT.end}`,barrier:'CPW 86th→77th (staging) + 77th→Columbus Circle→59th→6th Ave→34th→7th Ave',note:'Surface crossings are restricted/controlled by NYPD during the window.'};
+}
+function check_route_crossing(route){
+ // Underground subway legs are exempt; any surface leg (walk, bus) that crosses the barrier is blocked.
+ const steps=(route.legs||[]).flatMap(l=>l.steps||[]);
+ if(!steps.length)return crossesBarrier(decode(route.polyline.encodedPolyline));
+ return steps.some(s=>{const v=s.transitDetails?.transitLine?.vehicle?.type;if(v==='SUBWAY')return false;return s.polyline&&crossesBarrier(decode(s.polyline.encodedPolyline))});
+}
+
+// ---------- Map ----------
+let map,layers=[];
+function loadMaps(key){return new Promise((res,rej)=>{if(window.google?.maps)return res();window.__init=res;const s=document.createElement('script');s.src=`https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&callback=__init&v=weekly`;s.onerror=rej;document.head.appendChild(s)})}
+function drawBase(){map=new google.maps.Map($('#map'),{center:{lat:40.7655,lng:-73.9800},zoom:13,mapTypeControl:false,streetViewControl:false});
+ new google.maps.Polyline({map,path:BARRIER.map(([lat,lng])=>({lat,lng})),strokeColor:'#d93025',strokeWeight:9,strokeOpacity:.75});
+ DETOURS.forEach(d=>new google.maps.Circle({map,center:{lat:d.ll[0],lng:d.ll[1]},radius:60,fillColor:'#188038',fillOpacity:.6,strokeWeight:0}))}
+function drawRoute(route,color,dash){if(!map)return;const path=decode(route.polyline.encodedPolyline).map(([lat,lng])=>({lat,lng}));
+ layers.push(new google.maps.Polyline({map,path,strokeColor:color,strokeWeight:dash?3:5,strokeOpacity:dash?.6:1}))}
+
+// ---------- Agent loop: intent → context → tools → verify → rank → human approval ----------
+async function plan(){
+ const key=$('#key').value.trim();$('#trace').textContent='';layers.forEach(l=>l.setMap(null));layers=[];
+ if(!key){$('#result').innerHTML='<span class="warn">Paste a Google Maps Platform demo key first.</span>';return}
+ try{localStorage.setItem('crosstownKey',key)}catch{}
+ const intent={from:$('#from').value,to:$('#to').value,dep:$('#dep').value,by:$('#by').value,mob:$('#mob').value,contact:$('#contact').value.trim()};
+ log('1 intent      '+JSON.stringify(intent));
+ try{await loadMaps(key);if(!map)drawBase()}catch{log('  map failed to load; continuing without map')}
+ const dis=get_parade_disruptions(intent.dep);log('2 get_parade_disruptions → active='+dis.active+' window '+dis.window);
+ let wind;try{wind=await get_wind_outlook(key,$('#wind').value);log(`3 get_wind_outlook → ${wind.sustained} mph, gusts ${wind.gust} (${wind.source})`)}catch(e){wind=null;log('3 get_wind_outlook → unavailable ('+e.message+'); planning without it')}
+ const windy=wind&&(wind.sustained>WIND_LIMIT.sustained||wind.gust>WIND_LIMIT.gust);
+ const departure=new Date(iso(intent.dep)).toISOString();
+ let direct;try{direct=await compute_route({origin:intent.from,destination:intent.to,mode:'WALK'},key)}catch(e){$('#result').innerHTML='<span class="warn">'+e.message+'</span>';log('4 compute_route FAILED → '+e.message+'. Agent stops; nothing sent.');return}
+ const blocked=dis.active&&check_route_crossing(direct);drawRoute(direct,'#5f6368',true);
+ log(`4 compute_route WALK direct → ${mins(direct.duration)} min · check_route_crossing=${blocked}`);
+ if(!blocked){$('#result').innerHTML=`<span class="ok">No action needed.</span> Your walk (${mins(direct.duration)} min) never crosses the parade route${dis.active?'':' and you leave outside the closure window'}. Crosstown keeps watching and only interrupts if that changes.`;log('5 verify → direct route clear; no plan change, no message drafted');return}
+ // Alternatives
+ const opts=[];
+ for(const d of DETOURS){try{const r=await compute_route({origin:intent.from,destination:intent.to,mode:'WALK',via:d.ll},key);const bad=check_route_crossing(r);opts.push({name:d.name,route:r,min:mins(r.duration),bad,kind:'walk'});log(`5 compute_route WALK via ${d.id} → ${mins(r.duration)} min · crosses=${bad}`)}catch(e){log('5 compute_route via '+d.id+' failed → skipped ('+e.message+')')}}
+ try{const r=await compute_route({origin:intent.from,destination:intent.to,mode:'TRANSIT',departure},key);const bad=check_route_crossing(r);
+  const lines=(r.legs||[]).flatMap(l=>l.steps||[]).map(s=>s.transitDetails?.transitLine).filter(Boolean).map(l=>(l.vehicle?.type||'')+' '+(l.nameShort||'')).join(', ');
+  opts.push({name:'Go under it by subway'+(lines?' ('+lines+')':''),route:r,min:mins(r.duration),bad,kind:'transit'});log(`5 compute_route TRANSIT → ${mins(r.duration)} min · ${lines||'no lines'} · surface crossing=${bad}`)}catch(e){log('5 compute_route TRANSIT failed → skipped ('+e.message+')')}
+ // Rank with preferences + disruptions
+ const byT=new Date(iso(intent.by)),depT=new Date(iso(intent.dep));
+ opts.forEach(o=>{o.notes=[];o.score=o.min;
+  if(o.bad){o.score+=999;o.notes.push('still crosses a closed street')}
+  if(o.kind==='transit'&&intent.mob==='stroller'){o.score+=8;o.notes.push('stairs risk with stroller')}
+  if(o.kind==='transit'&&intent.mob==='wheelchair'){o.score+=25;o.notes.push('needs station elevator check (not in Routes API)')}
+  if(windy&&o.kind==='walk'){o.score+=10;o.notes.push('high wind: balloons may fly low, expect crowd surges near route')}
+  o.eta=new Date(depT.getTime()+o.min*60000);if(o.eta>byT)o.notes.push('misses arrive-by');});
+ opts.sort((a,b)=>a.score-b.score);const best=opts.find(o=>!o.bad);
+ log('6 rank → '+opts.map(o=>o.name.split(' (')[0]+'='+o.score).join(' | '));
+ if(!best){$('#result').innerHTML='<span class="warn">Every option still crosses a closed street.</span> Agent will not guess. Leave after 1:00 p.m. or open the NYPD crossing list.';log('7 verify → no valid option; escalated to user');return}
+ opts.forEach(o=>drawRoute(o.route,o===best?'#188038':'#1a73e8',o!==best));
+ const late=best.eta>byT, msg=`Hi ${intent.contact||'there'}, parade is blocking the direct way. I'm taking: ${best.name}. ETA ${hm(best.eta)}.`;
+ log(`7 verify → best="${best.name}" ETA ${hm(best.eta)}${late?' (LATE)':''}; recheck crossing=false`);
+ log('8 draft_eta_message → awaiting human approval (side effect: messages an external person)');
+ $('#result').innerHTML=`<div class="warn">Your direct walk crosses the parade route (${dis.window}).</div>
+  ${wind?`<div>Wind for parade hours: ${wind.sustained} mph, gusts ${wind.gust} ${windy?'<span class="warn">over the balloon limit (23/34)</span>':'<span class="ok">under the balloon limit</span>'}</div>`:''}
+  ${opts.map(o=>`<div class="opt ${o===best?'best':''} ${o.bad?'bad':''}"><b>${o.name}</b><span class="pill">${o.min} min</span><span class="pill">ETA ${hm(o.eta)}</span>${o.notes.length?'<br><small>'+o.notes.join(' · ')+'</small>':''}</div>`).join('')}
+  ${late?`<p class="warn">Best option still misses ${intent.by}. Leave ${Math.ceil((best.eta-byT)/60000)} min earlier.</p>`:''}
+  <p><b>Approve this action?</b><br><small>Text to ${intent.contact||'contact'}:</small><br>"${msg}"</p>
+  <div class="approve"><button id="yes">Approve &amp; open text</button><button id="no">Don't send</button></div>`;
+ $('#yes').onclick=()=>{log('9 user APPROVED → opening SMS composer (user presses send)');location.href='sms:?&body='+encodeURIComponent(msg)};
+ $('#no').onclick=()=>{log('9 user DECLINED → nothing sent; plan kept');$('#yes').disabled=true};
+}
+
+// ---------- Boot ----------
+function setPreset(){const p=PRESETS[+$('#preset').value];$('#from').value=p[0];$('#to').value=p[1]}
+$('#preset').onchange=setPreset;setPreset();
+$('#go').onclick=plan;
+const qk=new URLSearchParams(location.search).get('key');let saved='';try{saved=localStorage.getItem('crosstownKey')||''}catch{}
+$('#key').value=qk||saved;
+</script>
+</body>
+</html>

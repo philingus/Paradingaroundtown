@@ -1,0 +1,54 @@
+{
+  "server": "crosstown-mcp",
+  "description": "MCP tools an outside assistant (Gemini, Claude, Siri) calls to get a New Yorker across the Macy's 100th parade route. Read tools return processed outputs only. The one write tool needs a user confirmation token.",
+  "tools": [
+    {
+      "name": "get_parade_disruptions",
+      "description": "Closure window and barrier line for a given time on Thanksgiving Day 2026. Returns status, not the raw closure dataset.",
+      "inputSchema": {"type": "object", "properties": {"time": {"type": "string", "description": "HH:MM, America/New_York, on 2026-11-26"}}, "required": ["time"]},
+      "annotations": {"readOnlyHint": true, "openWorldHint": false}
+    },
+    {
+      "name": "get_wind_outlook",
+      "description": "Max sustained wind and gusts (mph) for parade hours from the Google Weather API, compared with NYC balloon limits (23 mph sustained, 34 mph gusts).",
+      "inputSchema": {"type": "object", "properties": {"date": {"type": "string", "format": "date"}}, "required": ["date"]},
+      "annotations": {"readOnlyHint": true, "openWorldHint": true}
+    },
+    {
+      "name": "plan_crossing",
+      "description": "Computes the direct route plus detours (around the south end, around the north end, under it by subway) with the Google Routes API, drops any option whose surface legs cross the barrier, and ranks the rest by time and mobility needs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "origin": {"type": "string"},
+          "destination": {"type": "string"},
+          "depart_at": {"type": "string", "description": "HH:MM on 2026-11-26"},
+          "arrive_by": {"type": "string"},
+          "mobility": {"type": "string", "enum": ["none", "stroller", "wheelchair"]}
+        },
+        "required": ["origin", "destination", "depart_at"]
+      },
+      "annotations": {"readOnlyHint": true, "openWorldHint": true}
+    },
+    {
+      "name": "watch_trip",
+      "description": "Re-runs plan_crossing on a schedule until arrival and returns a change only if the best option changes or the ETA slips past arrive_by.",
+      "inputSchema": {"type": "object", "properties": {"plan_id": {"type": "string"}, "every_minutes": {"type": "integer", "minimum": 5}}, "required": ["plan_id"]},
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}
+    },
+    {
+      "name": "send_eta_message",
+      "description": "Texts the user's contact the chosen plan and ETA. Rejected unless confirmation_token comes from the user approving the exact message text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contact_id": {"type": "string"},
+          "message": {"type": "string", "maxLength": 300},
+          "confirmation_token": {"type": "string"}
+        },
+        "required": ["contact_id", "message", "confirmation_token"]
+      },
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true}
+    }
+  ]
+}
